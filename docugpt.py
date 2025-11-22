@@ -1,17 +1,20 @@
 import streamlit as st
 from PyPDF2 import PdfReader
+
 from langchain_community.vectorstores import FAISS
-from langchain_core.embeddings import Embeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.question_answering import load_qa_chain
-from langchain.llms import HuggingFacePipeline
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from transformers import pipeline
 from sentence_transformers import SentenceTransformer
 
-# Local Embedding Wrapper
+from langchain_community.llms import HuggingFacePipeline
+from langchain_core.embeddings import Embeddings
+
+
+# ---- Custom Embedding Wrapper ----
 class LocalEmbeddings(Embeddings):
     def __init__(self):
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.model = SentenceTransformer("all-MiniLM-L6-v2")
 
     def embed_documents(self, texts):
         return self.model.encode(texts, convert_to_tensor=False)
@@ -19,59 +22,71 @@ class LocalEmbeddings(Embeddings):
     def embed_query(self, text):
         return self.model.encode([text], convert_to_tensor=False)[0]
 
-# Streamlit UI
+
+# ---- UI ----
 st.set_page_config(page_title="DocuGPT", layout="centered")
 st.header("📄 DocuGPT")
 
 with st.sidebar:
     st.title("My Notes")
-    uploaded_file=st.file_uploader("Upload Notes PDF and start asking questions",type="pdf")
+    uploaded_file = st.file_uploader("Upload Notes PDF and start asking questions", type="pdf")
 
-if uploaded_file is not None:
-    # Step 1: Extract text
+
+if uploaded_file:
+    # Extract text
     reader = PdfReader(uploaded_file)
-    raw_text = ""
-    for page in reader.pages:
-        raw_text += page.extract_text() or ""
+    raw_text = "".join(page.extract_text() or "" for page in reader.pages)
 
-    # Step 2: Chunk the text
+    # Split text into chunks
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     chunks = splitter.split_text(raw_text)
 
-    if not chunks:
-        st.error("⚠️ No text could be extracted from the PDF.")
-        st.stop()
+    # Create vector store
+    embeddings = LocalEmbeddings()
+    vector_store = FAISS.from_texts(chunks, embeddings)
+    retriever = vector_store.as_retriever()
 
-    # Step 3: Create vector store
-    try:
-        embeddings = LocalEmbeddings()
-        vector_store = FAISS.from_texts(chunks, embeddings)
-        st.success("✅ Document uploaded successfully")
-    except Exception as e:
-        st.error(f"❌ Error creating vector store: {e}")
-        st.stop()
+    st.success("📂 PDF processed successfully!")
 
-    # Step 4: Ask user input
+    # Ask for user query
     question = st.text_input("Ask a question about the PDF:")
 
     if question:
-        try:
-            hf_pipeline = pipeline(
-                "text2text-generation",
-                model="google/flan-t5-base",
-                tokenizer="google/flan-t5-base",
-                max_length=512,
-                temperature=0.5,
-            )
+        # Load FLAN-T5
+        hf_pipeline = pipeline(
+            "text2text-generation",
+            model="google/flan-t5-base",
+            tokenizer="google/flan-t5-base",
+            max_length=512,
+            temperature=0.5,
+        )
 
-            llm = HuggingFacePipeline(pipeline=hf_pipeline)
-            chain = load_qa_chain(llm=llm, chain_type="stuff")
+        llm = HuggingFacePipeline(pipeline=hf_pipeline)
 
-            docs = vector_store.similarity_search(question)
-            response = chain.run(input_documents=docs, question=question)
+        # Retrieve relevant chunks
+        docs = retriever.invoke(question)
 
-            st.markdown("**Answer:**")
-            st.info(response)
+        # Merge chunks into a prompt (truncate to avoid limit)
+        context = "\n\n".join([d.page_content for d in docs])
 
-        except Exception as e:
-            st.error(f"❌ Error generating answer: {e}")
+        # 🔥 Prevent token overflow
+        MAX_CHARS = 2000  # tweak depending on model limits
+        context = context[:MAX_CHARS]
+
+        # Construct final prompt
+        prompt = f"""
+You are an AI assistant. Answer concisely based ONLY on the context.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:
+"""
+
+        # Generate response
+        response = llm.invoke(prompt)
+
+        st.subheader("Answer:")
+        st.info(response)
